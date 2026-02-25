@@ -3,7 +3,7 @@
 
 **Hackathon:** INDCON 2026  
 **Theme:** Supply Chain Optimization & Industrial Data Analytics  
-**Team:** [Your Team Name]
+**Team:** KUSH
 
 ---
 
