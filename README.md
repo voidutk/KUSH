@@ -20,21 +20,21 @@ This system transforms supply chain management from reactive firefighting to pro
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  Data Layer: Synthetic Industrial Supply Chain Data     │
-│  (1,000 records, 26 features, ABC-XYZ SKU classification) │
+│ (1,000 records, 26 features, ABC-XYZ SKU classification)│
 ├─────────────────────────────────────────────────────────┤
 │  ML Models:                                             │
-│    • Gradient Boosting Demand Forecaster (MAPE 7.8%)   │
+│    • Gradient Boosting Demand Forecaster (MAPE 7.8%)    │
 │    • Random Forest Delay Classifier (AUC-ROC 0.69)      │
 ├─────────────────────────────────────────────────────────┤
 │  Resilience Engine:                                     │
-│    • P(stockout) calculation using normal distribution │
-│    • Dynamic risk weights by supplier redundancy         │
-│    • 5-tier recommendation system                        │
+│    • P(stockout) calculation using normal distribution  │
+│    • Dynamic risk weights by supplier redundancy        │
+│    • 5-tier recommendation system                       │
 ├─────────────────────────────────────────────────────────┤
 │  Decision Support:                                      │
-│    • Natural language explanations                       │
-│    • What-if scenario analysis                           │
-│    • Stress testing framework                            │
+│    • Natural language explanations                      │
+│    • What-if scenario analysis                          │
+│    • Stress testing framework                           │
 └─────────────────────────────────────────────────────────┘
 ```
 
