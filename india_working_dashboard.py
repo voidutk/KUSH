@@ -207,6 +207,65 @@ def get_smart_insights(risk_data):
     
     return insights
 
+
+def calculate_inventory_policy(assessment, lead_time_days=10, service_level=0.95):
+    """Generate actionable inventory policy recommendations from risk outputs."""
+    daily_demand = max(assessment.get('effective_demand', 0) / 7, 1)
+    shortage_ratio = max(assessment.get('shortage_ratio', 0), 0)
+    delay_probability = assessment.get('delay_probability', 0)
+    base_inventory = assessment.get('input_demand', 0) * 2
+
+    z_score_map = {0.9: 1.28, 0.95: 1.65, 0.98: 2.05}
+    z_score = z_score_map.get(service_level, 1.65)
+    demand_std = daily_demand * max(0.1, shortage_ratio + 0.1)
+
+    safety_stock = z_score * demand_std * np.sqrt(max(lead_time_days, 1))
+    reorder_point = (daily_demand * lead_time_days) + safety_stock
+    suggested_inventory = max(base_inventory, reorder_point * 1.2)
+
+    expedited_fraction = min(0.5, shortage_ratio + (0.2 if delay_probability > 0.35 else 0.0))
+    expected_expedited_units = daily_demand * 30 * expedited_fraction
+    expedited_cost = expected_expedited_units * 1200
+
+    return {
+        "daily_demand": float(daily_demand),
+        "safety_stock": float(safety_stock),
+        "reorder_point": float(reorder_point),
+        "suggested_inventory": float(suggested_inventory),
+        "expected_expedited_units": float(expected_expedited_units),
+        "monthly_expedited_cost": float(expedited_cost),
+    }
+
+
+def generate_action_plan(assessment, policy):
+    """Convert analytics into a realistic execution plan."""
+    risk_class = assessment.get('risk_class', 'LOW')
+    is_shortage = assessment.get('is_shortage', False)
+
+    priority = "P1" if risk_class == "HIGH" else "P2" if risk_class == "MEDIUM" else "P3"
+    plan = [
+        {
+            "Priority": priority,
+            "Timeline": "Next 24 hours",
+            "Owner": "Supply Planner",
+            "Action": f"Set reorder trigger to {policy['reorder_point']:.0f} units and increase safety stock to {policy['safety_stock']:.0f} units",
+        },
+        {
+            "Priority": "P1" if is_shortage else "P2",
+            "Timeline": "Next 3 days",
+            "Owner": "Procurement",
+            "Action": "Negotiate backup supplier capacity and validate alternate transport lane",
+        },
+        {
+            "Priority": "P2",
+            "Timeline": "Next 2 weeks",
+            "Owner": "Operations",
+            "Action": "Review weekly S&OP forecast bias and update SKU-level min/max policies",
+        },
+    ]
+
+    return pd.DataFrame(plan)
+
 def get_gemini_insights_real(client, risk_data, scenario_context=""):
     """Get real AI insights from Gemini API"""
     try:
@@ -341,8 +400,10 @@ with st.sidebar:
                 st.session_state.gemini_error = error
                 if "quota" in error.lower():
                     st.warning("⚠️ Gemini API quota exceeded. Using intelligent fallback insights.")
+                elif "name resolution" in error.lower() or "errno" in error.lower() or "connection" in error.lower():
+                    st.warning("⚠️ No internet connection. Using intelligent fallback insights.")
                 else:
-                    st.error(f"❌ Failed to connect: {error}")
+                    st.warning(f"⚠️ Gemini unavailable: {error[:60]}. Using fallback insights.")
     else:
         st.markdown('<div class="api-status">ℹ️ AI Key Not Found</div>', unsafe_allow_html=True)
         st.markdown("Add your Gemini API key to .env file for AI features")
@@ -375,13 +436,23 @@ def train_models():
     progress_bar.progress(50)
     
     start_time = time.time()
-    st.session_state.corrected_engine.train_fast_models()
+    st.session_state.corrected_engine.train_fast_models(force_retrain=True)
     training_time = time.time() - start_time
     
     status_text.text("Models ready for analysis")
     progress_bar.progress(100)
     
     st.success(f"Models trained successfully in {training_time:.2f} seconds")
+    
+    # Show real evaluation metrics
+    metrics = st.session_state.corrected_engine.model_metrics
+    if metrics:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Demand R²", f"{metrics['demand_r2']:.2f}")
+        m2.metric("Delay Accuracy", f"{metrics['delay_accuracy']:.1%}")
+        m3.metric("Delay F1 Score", f"{metrics['delay_f1']:.2f}")
+        m4.metric("Delay ROC-AUC", f"{metrics['delay_roc_auc']:.2f}")
+        st.caption(f"Evaluated on {metrics['test_samples']} held-out test samples (trained on {metrics['train_samples']})")
     
     time.sleep(1)
     status_text.empty()
@@ -425,10 +496,11 @@ def main():
         """, unsafe_allow_html=True)
     
     with col2:
-        st.markdown("""
+        real_acc = st.session_state.corrected_engine.model_metrics.get('delay_accuracy', 0)
+        st.markdown(f"""
         <div class="metric-card">
-        <div class="metric-value">95%+</div>
-        <div class="metric-label">Accuracy Rate</div>
+        <div class="metric-value">{real_acc:.0%}</div>
+        <div class="metric-label">Delay Accuracy (Test Set)</div>
         </div>
         """, unsafe_allow_html=True)
     
@@ -480,6 +552,12 @@ def risk_assessment_tab():
                 region = st.selectbox("Region", ["NA", "EU", "APAC"])
                 inventory = st.slider("Available Inventory", 0, 1000, 300)
                 sole_source = st.checkbox("Single Source Supplier")
+
+            col_c, col_d = st.columns(2)
+            with col_c:
+                lead_time_days = st.slider("Lead Time (days)", 3, 45, 10)
+            with col_d:
+                target_service = st.select_slider("Target Service Level", options=[0.90, 0.95, 0.98], value=0.95)
             
             geo_risk = st.slider("Regional Risk Factor", 0.0, 1.0, 0.3)
             demand_vol = st.slider("Demand Volatility", 0.5, 3.0, 1.5)
@@ -496,7 +574,7 @@ def risk_assessment_tab():
                     "is_sole_source": 1 if sole_source else 0,
                     "current_inventory": inventory,
                     "geopolitical_risk": geo_risk,
-                    "lead_time": 10,
+                    "lead_time": lead_time_days,
                     "demand_volatility": demand_vol
                 }])
                 
@@ -508,6 +586,13 @@ def risk_assessment_tab():
                 # Store results
                 st.session_state.last_assessment = assessment
                 st.session_state.processing_time = processing_time
+                st.session_state.last_inputs = {
+                    "region": region,
+                    "sku_class": sku_class,
+                    "sole_source": sole_source,
+                    "lead_time_days": lead_time_days,
+                    "target_service": target_service,
+                }
     
     with col2:
         if 'last_assessment' in st.session_state:
@@ -552,9 +637,49 @@ def risk_assessment_tab():
             
             # Action
             st.info(f"**Recommendation:** {assessment['recommended_action']}")
+
+            # Real feature importance chart
+            if 'feature_importances' in assessment and assessment['feature_importances']:
+                st.markdown("### 🧠 Feature Importance (from trained model)")
+                fi_df = pd.DataFrame(assessment['feature_importances'])
+                fig_fi = px.bar(
+                    fi_df, x='importance', y='feature',
+                    orientation='h',
+                    title='What Drives Risk Predictions',
+                    labels={'importance': 'Relative Importance', 'feature': ''},
+                    color='importance',
+                    color_continuous_scale='Tealgrn',
+                )
+                fig_fi.update_layout(yaxis={'categoryorder': 'total ascending'}, height=350)
+                st.plotly_chart(fig_fi, use_container_width=True)
+
+            # Real-world inventory policy
+            last_inputs = st.session_state.get('last_inputs', {})
+            policy = calculate_inventory_policy(
+                assessment,
+                lead_time_days=last_inputs.get('lead_time_days', 10),
+                service_level=last_inputs.get('target_service', 0.95)
+            )
+
+            st.markdown("### 📦 Suggested Inventory Policy")
+            p1, p2 = st.columns(2)
+            with p1:
+                st.metric("Reorder Point", f"{policy['reorder_point']:.0f} units")
+                st.metric("Safety Stock", f"{policy['safety_stock']:.0f} units")
+            with p2:
+                st.metric("Suggested Buffer Inventory", f"{policy['suggested_inventory']:.0f} units")
+                st.metric("Monthly Expedite Cost Risk", format_inr(policy['monthly_expedited_cost']))
+
+            action_plan = generate_action_plan(assessment, policy)
+            st.markdown("### ✅ Action Plan")
+            st.dataframe(action_plan, use_container_width=True, hide_index=True)
             
             # AI Insights (Real Gemini)
-            context = f"Indian region: {region}, SKU: {sku_class}, Single Source: {sole_source}"
+            context = (
+                f"Indian region: {last_inputs.get('region', 'NA')}, "
+                f"SKU: {last_inputs.get('sku_class', 'A-X')}, "
+                f"Single Source: {last_inputs.get('sole_source', False)}"
+            )
             insights = get_gemini_insights_real(st.session_state.gemini_client, assessment, context)
             
             st.markdown('<div class="insight-box">', unsafe_allow_html=True)
@@ -578,6 +703,31 @@ def risk_assessment_tab():
                 st.markdown(f"**Indian Market Context:** {insights['indian_context']}")
             
             st.markdown(f"**📋 Executive Summary:** {insights['ai_summary']}")
+
+            export_payload = {
+                "assessment": assessment,
+                "inventory_policy": policy,
+                "action_plan": action_plan.to_dict(orient="records"),
+                "insights": insights,
+            }
+            class _NumpyEncoder(json.JSONEncoder):
+                def default(self, obj):
+                    if isinstance(obj, (np.integer,)):
+                        return int(obj)
+                    if isinstance(obj, (np.floating,)):
+                        return float(obj)
+                    if isinstance(obj, (np.bool_,)):
+                        return bool(obj)
+                    if isinstance(obj, np.ndarray):
+                        return obj.tolist()
+                    return super().default(obj)
+
+            st.download_button(
+                "Download Risk Brief (JSON)",
+                data=json.dumps(export_payload, indent=2, cls=_NumpyEncoder),
+                file_name="risk_brief.json",
+                mime="application/json",
+            )
             
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -653,7 +803,11 @@ def scenario_analysis_tab():
             
             # Display results
             df = pd.DataFrame(results)
-            st.dataframe(df, use_container_width=True)
+            df["Operational Priority"] = np.where(
+                df["Risk Class"] == "HIGH", "Immediate",
+                np.where(df["Risk Class"] == "MEDIUM", "Planned", "Monitor")
+            )
+            st.dataframe(df.sort_values(by="Risk Score", ascending=False), use_container_width=True)
             
             # Visualization
             fig = px.bar(df, x="Scenario", y="Risk Score", color="Risk Class", 
